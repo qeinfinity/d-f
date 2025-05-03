@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "dealer-flow-stack"
+version = "0.1.0"
+description = "Real-time dealer-flow dashboard for BTC options"
+authors = ["boscovich"]
+readme = "README.md"
+packages = [{ include = "dealer_flow" }]
+
+[tool.poetry.dependencies]
+python = "3.9.6"
+websockets = "^12.0"
+aiohttp = "^3.9"
+redis = "^5.0"
+numpy = "^1.26"
+pandas = "^2.2"
+numba = "^0.59"
+pydantic = "^2.7"
+fastapi = "^0.111"
+uvicorn = { extras = ["standard"], version = "^0.29" }
+orjson = "^3.10"
+clickhouse-driver = "^0.2.9"
+plotly = "^5.20"
+
+[tool.poetry.group.dev.dependencies]
+black = "^24.3"
+isort = "^5.13"
+mypy = "^1.9"
+pytest = "^8.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+

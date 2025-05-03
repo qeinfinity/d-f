@@ -1,0 +1,6 @@
+.git
+__pycache__/
+*.parquet
+*.env
+*.lock
+node_modules
