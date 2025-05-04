@@ -15,4 +15,6 @@ def gamma_flip_distance(
     if zero_idx.size == 0:
         return None
     flip_strike = gamma_by_strike.index[zero_idx[0] + 1]
-    return flip_strike / spot_price - 1.0
+    if spot_price == 0:
+        return None
+    return float(flip_strike / spot_price - 1.0)

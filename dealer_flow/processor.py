@@ -18,6 +18,7 @@ publishes roll-ups every second to `dealer_metrics`.
 """
 import asyncio, time, orjson, pandas as pd, numpy as np, sys
 import datetime as dt, calendar
+import re, datetime as dt, calendar
 from collections import deque, defaultdict
 from dealer_flow.redis_stream import get_redis, STREAM_KEY_RAW, STREAM_KEY_METRICS
 from dealer_flow.gamma_flip import gamma_flip_distance
@@ -25,15 +26,19 @@ from dealer_flow.vanna_charm_volga import roll_up
 from dealer_flow.dealer_net import infer_dealer_net
 from dealer_flow.greek_calc import greeks as bs_greeks   # NEW
 
+JSON_OPTS = orjson.OPT_SERIALIZE_NUMPY
 GROUP, CONSUMER = "processor", "p1"
 BLOCK_MS = 200
 ROLL_FREQ = 1.0  # s
+_DATE_RE = re.compile(r"(\d{1,2})([A-Z]{3})(\d{2})")  # day, month, yy
+
 
 # in-memory state
 greek_store = {}        # inst -> dict(gamma, vanna, charm, volga, OI)
 gamma_by_strike = {}    # strike -> net dealer gamma
 prices = deque(maxlen=1)
 tick_times = deque(maxlen=1000)
+spot = [0.0]
 
 async def ensure_group(r):
     try:
@@ -53,19 +58,33 @@ async def maybe_publish(redis):
     if df.empty:
         return
     dealer = infer_dealer_net(df.reset_index(names="instrument"))
-    agg = roll_up(dealer)
+    # apply dealer sign to greeks
+    signed = dealer.copy()
+    signed[["gamma", "vanna", "charm", "volga"]] = (
+        signed[["gamma", "vanna", "charm", "volga"]]
+        .mul(signed["dealer_side_mult"], axis=0)
+    )
+    agg = roll_up(signed)
     flip = gamma_flip_distance(pd.Series(gamma_by_strike), prices[-1])
     payload = {"ts": now, "price": prices[-1], "msg_rate": len(tick_times), **agg, "flip_pct": flip}
-    await redis.xadd(STREAM_KEY_METRICS, {"d": orjson.dumps(payload)})
+    await redis.xadd(
+        STREAM_KEY_METRICS,
+        {"d": orjson.dumps(payload, option=JSON_OPTS)}
+    )
 
 def _expiry_ts(sym: str) -> float:
-    # sym like BTC-24MAY25-60000-P
-    day = int(sym[4:6])
-    mon = sym[6:9]           # MAY
-    year = int(sym[9:11])    # 25 (=> 2025)
+    """
+    Extract expiry from option symbol. Returns UTC timestamp 08:00 expiry.
+    """
+    date_part = sym.split("-")[1]           # e.g. 5MAY25
+    m = _DATE_RE.fullmatch(date_part)
+    if not m:
+        raise ValueError(f"unparsable date {date_part}")
+    day, mon, yy = int(m[1]), m[2], int(m[3])
     month_num = dt.datetime.strptime(mon, "%b").month
-    year_full = 2000 + year
-    return calendar.timegm(dt.datetime(year_full, month_num, day, 8).timetuple())
+    year_full = 2000 + yy
+    dt_exp = dt.datetime(year_full, month_num, day, 8, tzinfo=dt.timezone.utc)
+    return dt_exp.timestamp()
 
 async def processor():
     redis = await get_redis()
@@ -84,6 +103,10 @@ async def processor():
                         ch, d = params.get("channel"), params.get("data")
                         if not isinstance(d, dict):
                             continue
+                        if ch.startswith("deribit_price_index"):
+                            # Deribit returns {"price": <float>, ...}
+                            spot_price = float(d.get("price") or d.get("index_price"))
+                            continue
                         if ch.startswith("ticker"):
                             mark = float(d["mark_price"])
                             prices.append(mark)
@@ -95,7 +118,7 @@ async def processor():
                             T = max((expiry_ts - now_ts), 0.0) / (365 * 24 * 3600)
 
                             size  = d["open_interest"]        # contracts
-                            notional = size * mark
+                            notional = size * (spot[0] or mark)
 
                             deriv_greeks = d.get("greeks", {})
                             gamma = deriv_greeks.get("gamma", 0.0)

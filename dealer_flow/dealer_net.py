@@ -7,10 +7,19 @@ import numpy as np
 
 def infer_dealer_net(oi_df: pd.DataFrame) -> pd.DataFrame:
     """
-    oi_df columns: ['instrument','type','open_interest','side']
-    side: 'call_long','call_short','put_long','put_short'
-    Returns df with dealer_gamma, dealer_vanna, ... per instrument
+    oi_df may contain:
+        ['instrument', 'gamma', 'vanna', 'charm', 'volga', 'notional_usd', ...]
+    Optionally:
+        ['side'] with values like 'call_long', 'call_short', etc.
+
+    Returns same DF with a 'dealer_side_mult' column (1 or -1).
     """
-    # Placeholder: mark all customer shorts as dealer long
-    oi_df["dealer_side_mult"] = np.where(oi_df["side"].str.contains("short"), 1, -1)
+    if "side" in oi_df.columns:
+        oi_df["dealer_side_mult"] = np.where(
+            oi_df["side"].str.contains("short"), 1, -1
+        )
+    else:
+        # no side info yet – assume dealer needs to hedge ALL customer gamma
+        oi_df["dealer_side_mult"] = 1
+
     return oi_df
