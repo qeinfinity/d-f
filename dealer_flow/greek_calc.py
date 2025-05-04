@@ -2,6 +2,15 @@
 Black-Scholes greeks (γ, vanna, charm, volga) with numba JIT.
 All inputs are numpy arrays for vectorised speed.
 """
+"""
+Black-Scholes greeks (γ, vanna, charm, volga) with numba JIT.
+
+Doctest sanity check
+>>> import numpy as np; from dealer_flow.greek_calc import greeks
+>>> γ, v, c, vg = greeks(np.array([100]), np.array([100]), np.array([0.1]), 0.0, np.array([0.5]), np.array([1]))
+>>> round(float(γ), 6)
+0.079788
+"""
 import numpy as np
 from numba import njit
 from scipy.stats import norm  # only used for cdf/pdf
