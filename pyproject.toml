@@ -22,6 +22,7 @@ orjson = "^3.10"
 clickhouse-driver = "^0.2.9"
 plotly = "^5.20"
 aioredis = "^2.0"
+scipy = "^1.13"
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.3"

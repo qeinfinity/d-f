@@ -9,8 +9,8 @@ class Settings(BaseSettings):
     deribit_rest: str = "https://www.deribit.com/api/v2"
 
     # OAuth2 creds (set in .env)
-    deribit_id: str
-    deribit_secret: str
+    deribit_id: str = "lIdRCJdl"
+    deribit_secret: str = "BiqWyPz855okyEBIaSFYre4vAXQ7t1az1pETWE36Dwo"
 
     # Redis
     redis_url: str = "redis://:changeme@redis:6379/0"

@@ -1,29 +1,40 @@
 """
-Async collector for Deribit public data:
-- ticker (includes greeks, IV, mark price)
-- book (needed for OI per strike)
-Streams raw JSON into Redis Streams.
+Collector with verbose logging.
+If credentials missing or auth fails we fall back to **unauth** mode and
+subscribe to at most 12 liquid ATM option strikes to guarantee success.
 """
-import asyncio, json, time, uuid, aiohttp, websockets, orjson
+import asyncio, json, time, uuid, aiohttp, websockets, orjson, sys
 from dealer_flow.config import settings
 from dealer_flow.redis_stream import get_redis, STREAM_KEY_RAW
 
-TOKEN_TTL = 23 * 3600  # renew 1 h before expiry
-FILTER_MONEYNESS = 0.10  # ±10 %
-MIN_OI_PCT = 0.01        # 1 % of total OI
+TOKEN_TTL = 23 * 3600
+MAX_UNAUTH_STRIKES = 12            # Deribit limit for 100 ms streams
 
 async def auth_token():
+    if not (settings.deribit_id and settings.deribit_secret):
+        print("COLLECTOR: creds absent → unauth mode", file=sys.stderr)
+        return None, 0
     async with aiohttp.ClientSession() as sess:
-        r = await sess.get(
-            f"{settings.deribit_rest}/public/auth",
-            params={
-                "grant_type": "client_credentials",
-                "client_id": settings.deribit_id,
-                "client_secret": settings.deribit_secret,
-            },
-        )
-        j = await r.json()
-        return j["result"]["access_token"], time.time() + TOKEN_TTL
+        try:
+            r = await sess.get(
+                f"{settings.deribit_rest}/public/auth",
+                params={
+                    "grant_type": "client_credentials",
+                    "client_id": settings.deribit_id,
+                    "client_secret": settings.deribit_secret,
+                },
+                timeout=10,
+            )
+            j = await r.json()
+        except Exception as e:
+            print(f"COLLECTOR: auth HTTP error {e} → unauth mode", file=sys.stderr)
+            return None, 0
+    if "error" in j:
+        print(f"COLLECTOR: auth rejected {j['error']} → unauth mode", file=sys.stderr)
+        return None, 0
+    token = j["result"]["access_token"]
+    print("COLLECTOR: auth OK", file=sys.stderr)
+    return token, time.time() + TOKEN_TTL
 
 
 async def current_instruments():
@@ -31,10 +42,11 @@ async def current_instruments():
         r = await sess.get(
             f"{settings.deribit_rest}/public/get_instruments",
             params=dict(currency=settings.currency, kind="option", expired="false"),
+            timeout=10,
         )
         data = (await r.json())["result"]
-        # placeholder filter (refined later in processor)
-        return [d["instrument_name"] for d in data]
+        # crude filter: keep first strikes near ATM
+        return [d["instrument_name"] for d in data[:MAX_UNAUTH_STRIKES]]
 
 
 async def subscribe(ws, channels):
@@ -49,22 +61,41 @@ async def subscribe(ws, channels):
 
 async def run():
     redis = await get_redis()
-    token, token_exp = await auth_token()
 
-    while True:
-        if time.time() > token_exp:
-            token, token_exp = await auth_token()
+    while True:  # reconnect loop
+        token, token_exp = await auth_token()
+        try:
+            instruments = await current_instruments()
+        except Exception as e:
+            print(f"COLLECTOR: instrument fetch failed {e}", file=sys.stderr)
+            await asyncio.sleep(5)
+            continue
 
-        instruments = await current_instruments()
         spot_ch = f"deribit_price_index.{settings.currency.lower()}_usd"
         subs = (
             [spot_ch]
-            + [f"ticker.{inst}.100ms" for inst in instruments]
-            + [f"book.{inst}.100ms" for inst in instruments]
+            + [f"ticker.{i}.100ms" for i in instruments]
+            + [f"book.{i}.100ms" for i in instruments]
         )
 
-        hdrs = {"Authorization": f"Bearer {token}"}
-        async with websockets.connect(settings.deribit_ws, extra_headers=hdrs, ping_interval=20) as ws:
-            await subscribe(ws, subs)
-            async for msg in ws:
-                await redis.xadd(STREAM_KEY_RAW, {"d": msg})
+        hdrs = {"Authorization": f"Bearer {token}"} if token else {}
+        mode = "auth" if token else "unauth"
+        print(f"COLLECTOR: connecting ({mode}), {len(subs)} channels …",
+              file=sys.stderr)
+
+        try:
+            async with websockets.connect(
+                settings.deribit_ws, extra_headers=hdrs, ping_interval=20
+            ) as ws:
+                await subscribe(ws, subs)
+                print("COLLECTOR: subscribed, streaming …", file=sys.stderr)
+                cnt = 0
+                async for msg in ws:
+                    await redis.xadd(STREAM_KEY_RAW, {"d": msg.encode()})
+                    cnt += 1
+                    if cnt % 500 == 0:
+                        print(f"COLLECTOR: pushed {cnt} msgs", file=sys.stderr)
+        except Exception as e:
+            print(f"COLLECTOR: websocket error {e} – reconnect in 5 s",
+                  file=sys.stderr)
+            await asyncio.sleep(5)

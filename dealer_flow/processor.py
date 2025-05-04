@@ -59,6 +59,7 @@ async def maybe_publish(redis):
 async def processor():
     redis = await get_redis()
     await ensure_group(redis)
+    print("PROCESSOR: started, waiting for data …", file=sys.stderr)
     last_pub = time.time()
 
     while True:
@@ -73,17 +74,25 @@ async def processor():
                         if not isinstance(d, dict):
                             continue
                         if ch.startswith("ticker"):
-                            prices.append(float(d["mark_price"]))
+                            mark = float(d["mark_price"])
+                            prices.append(mark)
+                            inst = d["instrument_name"]                 # e.g. BTC-24MAY25-60000-P
+                            strike = float(inst.split("-")[2])
+                            size  = d["open_interest"]                  # contracts (1 BTC each)
+                            notional = size * mark     
+                            print(f"PROCESSOR: got ticker {inst}", file=sys.stderr)
                             greeks = {
                                 "gamma": d["greeks"]["gamma"],
                                 "vanna": d["greeks"]["vanna"],
                                 "charm": d["greeks"]["charm"],
                                 "volga": d["greeks"]["volga"],
-                                "open_interest": d["open_interest"],
-                                "strike": d["strike"],
+                                "notional_usd": notional,
+                                "strike": strike,
                             }
-                            greek_store[d["instrument_name"]] = greeks
-                            gamma_by_strike[d["strike"]] = gamma_by_strike.get(d["strike"], 0.0) + greeks["gamma"]
+                            greek_store[inst] = greeks
+                            gamma_by_strike[strike] = gamma_by_strike.get(strike, 0.0) + greeks["gamma"]
+                            if len(greek_store) % 1000 == 0:
+                                print(f"PROCESSOR: stored {len(greek_store)} greeks", file=sys.stderr)
                         tick_times.append(time.time())
                     except Exception as e:
                         print(f"PARSE ERR {e}", file=sys.stderr)

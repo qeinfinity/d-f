@@ -1,9 +1,11 @@
 import numpy as np
 import pandas as pd
+from typing import Optional
+
 
 def gamma_flip_distance(
     gamma_by_strike: pd.Series, spot_price: float
-) -> float | None:
+) -> Optional[float]:
     """
     gamma_by_strike: index=strike, value=net dealer gamma
     Finds first zero-cross and returns (strike/spot - 1)
