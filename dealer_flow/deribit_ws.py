@@ -99,3 +99,11 @@ async def run():
             print(f"COLLECTOR: websocket error {e} – reconnect in 5 s",
                   file=sys.stderr)
             await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    import asyncio, sys
+    try:
+        print("COLLECTOR: launching …", file=sys.stderr)
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        print("COLLECTOR: interrupted, exiting.", file=sys.stderr)

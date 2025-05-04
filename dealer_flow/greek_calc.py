@@ -13,7 +13,7 @@ Doctest sanity check
 """
 import numpy as np
 from numba import njit
-from scipy.stats import norm  # only used for cdf/pdf
+#from scipy.stats import norm  # only used for cdf/pdf
 
 SQRT_2PI = np.sqrt(2 * np.pi)
 
