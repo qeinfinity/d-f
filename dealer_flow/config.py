@@ -1,9 +1,9 @@
 from pathlib import Path
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
     deribit_ws: str = "wss://www.deribit.com/ws/api/v2"
-    redis_url: str = "redis://localhost:6379/0"
+    redis_url: str = "redis://redis:6379/0"
     clickhouse_host: str = "localhost"
     clickhouse_port: int = 9000
     currency: str = "BTC"

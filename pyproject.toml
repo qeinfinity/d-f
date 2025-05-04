@@ -15,11 +15,13 @@ numpy = "^1.26"
 pandas = "^2.2"
 numba = "^0.59"
 pydantic = "^2.7"
+pydantic-settings = "^2.0"
 fastapi = "^0.111"
 uvicorn = { extras = ["standard"], version = "^0.29" }
 orjson = "^3.10"
 clickhouse-driver = "^0.2.9"
 plotly = "^5.20"
+aioredis = "^2.0"
 
 [tool.poetry.group.dev.dependencies]
 black = "^24.3"
