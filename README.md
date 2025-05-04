@@ -41,7 +41,3 @@ dealer_flow/
   ├── rest_service.py
   ├── __main__.py
 ```
-
-
-
-poetry build failed because no 

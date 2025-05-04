@@ -117,3 +117,133 @@ output
 *   The `.dockerignore` file is critical and must *not* exclude essential files like `poetry.lock`.
 *   Local macOS development requiring `llvmlite`/`numba` needs careful LLVM version management. Install the specific required version (e.g., `llvm@14`) and ensure the build process uses it, potentially by manipulating the `PATH` directly during installation if environment variables are ignored.
 *   Be mindful of multiple Redis instances. Use `brew services` for managing the background instance reliably on macOS. Always verify which port an instance is running on and use `redis-cli -p <port> -a <password>` for specific connections. Ensure the `.env` file aligns with the target Redis instance.
+
+## Dealer-Flow Stack: Troubleshooting Log & Maintainer Guide (Continuation)
+
+**Previous State:** The Docker image (`dealer-flow`) builds successfully using a multi-stage process with `pip` and Poetry 1.8.3. The container starts via `docker run`, launching Uvicorn. However, initial attempts to run failed due to missing `aioredis` dependency and subsequently a Pydantic v1 vs v2 `BaseSettings` import error. These were resolved by adding `aioredis` and `pydantic-settings` to `pyproject.toml`, updating `poetry.lock`, modifying the import in `dealer_flow/config.py`, and rebuilding the image. The container now runs, but accessing the `/snapshot` endpoint yields errors.
+
+---
+
+**Phase 4: Runtime Logic Debugging (Post-Build)**
+
+1.  **Problem 13: `/snapshot` Endpoint Fails (`IndexError` / `500`)**
+    *   **Symptom:** Running the container via `docker run --env-file .env -p 8000:8000 dealer-flow` starts Uvicorn successfully. However, accessing `http://localhost:8000/snapshot` results in a `500 Internal Server Error`. Container logs show `IndexError: list index out of range` at `dealer_flow/rest_service.py:12` when executing `list(last)[0]`.
+    *   **Diagnosis:** The `redis.xrevrange(STREAM_KEY_METRICS, count=1)` call returns an empty list (`last`), indicating the target Redis stream `dealer_metrics` is empty or nonexistent. The endpoint code expects at least one entry.
+    *   **Initial Hypothesis:** The Redis connection logic inside the endpoint might be faulty *or* the stream simply isn't being populated. A manual test (`XADD dealer_metrics * d '{"test": "data"}'` inside the Redis container followed by accessing `/snapshot`) returned the dummy data successfully, confirming the API<->Redis read path works *if data exists*. The problem is data *creation*.
+
+2.  **Problem 14: `dealer_raw` Stream is Empty (Collector Not Running)**
+    *   **Symptom:** Following the `IndexError`, investigation shifted to why `dealer_metrics` was empty. The hypothesis was that the preceding step (populating the *raw* stream) might be failing.
+    *   **Diagnosis:** Connecting to the Redis container (`docker-compose exec redis redis-cli`) and checking the length of the raw stream (`XLEN dealer_raw`) revealed it was `(integer) 0`. This proved the `deribit_ws.py` collector was not running and adding data.
+    *   **Cause:** The `Dockerfile`'s `CMD ["uvicorn", ...]` only started the Uvicorn server. It did *not* execute the concurrent startup logic in `dealer_flow/__main__.py`, which was intended to launch the `ws_run` collector task alongside the server.
+    *   **Solution:** Implemented a `start.sh` script to explicitly launch both the collector (`python -m dealer_flow.deribit_ws &`) in the background and the Uvicorn server (`uvicorn ...`) in the foreground. Modified the `Dockerfile` to `COPY` and `chmod +x` this script, and changed the `CMD` to `["/app/start.sh"]`. Rebuilt the image and restarted using `docker-compose up`.
+    *   **Verification:** After restarting, `docker-compose exec redis redis-cli XLEN dealer_raw` returned `(integer) 1` (or more), confirming the collector was now running via the startup script.
+
+3.  **Problem 15: Processor Logic Skips Messages (Data Format / Auth Issue)**
+    *   **Symptom:** Even with the collector running and populating `dealer_raw`, `/snapshot` still returned `204 No Content` (the updated API response for an empty `dealer_metrics` stream). This indicated the *processor* step (reading `dealer_raw`, writing `dealer_metrics`) was failing.
+    *   **Diagnosis:** Added detailed logging to `dealer_flow/processor.py` and ran `docker-compose up` in the foreground. Logs revealed the processor was running, reading messages from `dealer_raw`, but consistently skipping them with messages like `PROCESSOR: Skipping message, no 'params' key.`. The logged message content showed a JSON-RPC error response from Deribit: `{'code': 13778, 'message': 'raw_subscriptions_not_available_for_unauthorized'}`.
+    *   **Cause:** The collector (`deribit_ws.py`) was attempting to subscribe to `.raw` suffixed channels (e.g., `ticker.BTC-PERPETUAL.raw`), which require authentication, but the WebSocket connection was unauthenticated. Deribit was rejecting the subscription and sending back an error message, which the processor correctly identified as not containing the expected data structure.
+    *   **Initial Proposed Solutions:**
+        *   A) Switch collector subscriptions to public channels (e.g., `ticker.BTC-PERPETUAL.100ms`).
+        *   B) Implement authentication in the collector.
+
+---
+
+**Phase 5: Architectural Realignment (Current State - Pending Implementation)**
+
+1.  **Problem 16: Collector/Goal Mismatch & Systemic Issues**
+    *   **Symptom:** User analysis (provided via prompt) reviewed the project state against the goal (options greeks dashboard), highlighting that even fixing the immediate auth error wouldn't solve the core problem.
+    *   **Diagnosis:** A comprehensive review confirmed multiple critical issues beyond the immediate `.raw` subscription error:
+        *   **Data Path Misalignment:** The collector targets *perpetual futures*, not *options*. The required data (options OI, greeks like delta, gamma, vega from tickers) needs different channel subscriptions (e.g., `ticker.{option_instrument_name}.100ms`, `book.{option_instrument_name}.100ms`) or REST calls.
+        *   **Missing OI/Dealer Logic:** Dealer position inference (`dealer_net.py`) is a placeholder and needs integration with OI data (via WS book snapshots or REST `get_book_summary_by_instrument`).
+        *   **Greek Calculation:** Higher-order greeks (vanna, charm, volga) are calculated in `greek_calc.py` but never used. The pipeline needs to ingest base parameters (S, K, T, IV, r - potentially from multiple sources) or Deribit-provided base greeks to feed this calculation or validate against Deribit's values.
+        *   **Latency/Scalability:** Subscribing to thousands of individual option tickers is likely too slow; requires filtering or multiplexing. The processor needs batching.
+        *   **Persistence:** No ClickHouse implementation exists for historical data.
+        *   **Security:** Redis password not enforced in Compose; `.env` lacks API key fields.
+    *   **Cause:** Initial scaffolding focused on structure, deferring correct data path implementation and integration logic. The initial WebSocket subscription was incorrect for the project's stated goal.
+    *   **Current State:** The application runs (collector, processor stub, API), but the data pipeline is fundamentally misaligned with the objective of processing options greeks. The processor reads raw futures auth error messages and the API endpoint can only serve manually injected data or 204s. The next step requires significant changes to `deribit_ws.py` (channel subscriptions, potentially REST calls for OI/params), implementation of `dealer_net.py`, integration of `greek_calc.py` and `vanna_charm_volga.py` within the `processor.py` loop, and likely splitting services in `docker-compose.yml`.
+
+**(End of Log - Awaiting Implementation of Architectural Changes)**
+
+
+## Dealer-Flow Stack: Troubleshooting Log & Maintainer Guide (Continuation from Phase 5)
+
+**Previous State:** Analysis identified significant architectural misalignment. The collector targeted perpetual futures, not options; dealer netting was a placeholder; the greeks engine was unused; and the processor lacked logic to bridge the gap. The immediate blocker was the collector failing due to authentication errors on `.raw` channels.
+
+---
+
+**Phase 6: Implementation & Refinement (Iterative Fixes)**
+
+1.  **Problem 16 Revisit & Simplification:**
+    *   **Context:** User provided comprehensive code patches based on previous analysis, aiming to implement authentication, fetch option instruments, calculate missing greeks, and publish metrics.
+    *   **Action:** Implemented the provided patches for `dealer_flow/config.py`, `.env.example`, `dealer_flow/deribit_ws.py`, `dealer_flow/processor.py`, `tests/test_gamma_flip.py`, and added a doctest header to `dealer_flow/greek_calc.py`.
+
+2.  **Problem 17: Processor Crash (`TypeError` on Type Hint)**
+    *   **Symptom:** `docker-compose up` failed immediately. The traceback showed `TypeError: unsupported operand type(s) for |: 'type' and 'NoneType'` originating from the return type hint `-> float | None:` in `dealer_flow/gamma_flip.py`.
+    *   **Diagnosis:** The `|` union syntax for type hints requires Python 3.10 or later. The Docker container was running Python 3.9.6.
+    *   **Cause:** Incompatible type hint syntax for the container's Python version.
+    *   **Solution:** Changed the type hint in `gamma_flip.py` to use `typing.Optional`:
+        *   Added `from typing import Optional`
+        *   Changed return hint to `-> Optional[float]`
+    *   **Note:** User clarified that Redis password was not being used, so `REDIS_URL` in `.env` remains `redis://redis:6379/0` and no password-related environment variables were added to `docker-compose.yml`.
+
+3.  **Problem 18: Processor Crash (`KeyError: 'side'`)**
+    *   **Symptom:** After fixing the type hint, `docker-compose up` started the collector and processor, but the processor crashed. Logs showed `KeyError: 'side'` originating from `dealer_flow/dealer_net.py` when accessing `oi_df["side"]`.
+    *   **Diagnosis:** The `infer_dealer_net` function assumed the input DataFrame (`oi_df`, created from `greek_store` in the processor) would always contain a `side` column (e.g., 'call_long', 'put_short'). However, the processor currently only populates `greek_store` with greek values, not side information from OI data.
+    *   **Cause:** Missing `side` column in the DataFrame passed to `infer_dealer_net`.
+    *   **Solution:**
+        *   Modified `dealer_net.py` to check if the `side` column exists. If not, default `dealer_side_mult` to `1` (assuming all positions need hedging initially).
+        *   Modified `processor.py` within `maybe_publish` to explicitly multiply the fetched/calculated greeks (`gamma`, `vanna`, `charm`, `volga`) by the `dealer_side_mult` before passing them to `roll_up`. This ensures the sign is applied correctly when side information becomes available later.
+
+4.  **Problem 19: Processor Crash (`TypeError` on JSON Serialization)**
+    *   **Symptom:** After fixing the `KeyError: 'side'`, the processor ran further but crashed during the `maybe_publish` step when writing to Redis. Logs showed `TypeError: Type is not JSON serializable: numpy.float64`.
+    *   **Diagnosis:** The `payload` dictionary being serialized contained values that were NumPy float types (e.g., `numpy.float64`), which the standard `orjson.dumps()` function doesn't handle by default.
+    *   **Cause:** Standard JSON serializers expect native Python types (int, float, str, etc.).
+    *   **Solution:** Utilized `orjson`'s NumPy serialization capability:
+        *   Added `JSON_OPTS = orjson.OPT_SERIALIZE_NUMPY` constant in `processor.py`.
+        *   Modified the `redis.xadd` call in `maybe_publish` to `orjson.dumps(payload, option=JSON_OPTS)`.
+
+5.  **Problem 20: Runtime Warnings & Incorrect Metrics (Divide by Zero / Wrong Price)**
+    *   **Symptom:** The application ran, and `/snapshot` returned JSON data, but the logs were filled with `RuntimeWarning: divide by zero encountered in scalar divide` from `gamma_flip.py`. The returned JSON showed `price: 0.0` and near-zero metrics (`NGI`, `VSS`, etc.).
+    *   **Diagnosis:**
+        *   The `gamma_flip_distance` function was receiving `spot_price = 0.0`, causing the division error.
+        *   The `processor.py` logic was incorrectly calculating `notional_usd = size * mark` (using the *option's* mark price) instead of `size * underlying_spot`.
+        *   The underlying spot price (`spot_price`) was never being updated because the processor wasn't correctly parsing messages from the `deribit_price_index.btc_usd` channel.
+    *   **Cause:** Failure to parse the spot price index message and using the wrong price (option mark price) for notional calculations.
+    *   **Solution:**
+        *   Added a zero check in `gamma_flip.py` before dividing: `if spot_price <= 0: return None`.
+        *   Modified `processor.py`:
+            *   Added a global `spot_price` variable initialized to `0.0`.
+            *   Added logic to parse messages from `deribit_price_index` channel and update `spot_price`.
+            *   Changed `notional` calculation to `size * (spot_price or mark)` (using spot price if available).
+            *   Removed the `underlying_price` assignment in `dealer.assign(...)` as `roll_up` uses `notional_usd` directly.
+        *   Added `import warnings; warnings.filterwarnings("ignore", category=RuntimeWarning)` to suppress the (now guarded against) warning display.
+
+6.  **Problem 21: Parse Error & Spot Price Still Zero (`KeyError: 'index_price'`)**
+    *   **Symptom:** After implementing the previous fix, the processor logged `PARSE ERR 'index_price'`, and the `/snapshot` endpoint still showed `price: 0.0`.
+    *   **Diagnosis:** The processor code attempted to access `d["index_price"]` from the price index message, but the actual key provided by Deribit is `price`.
+    *   **Cause:** Incorrect key used to access the spot price in the JSON payload.
+    *   **Solution:** Modified the price index parsing logic in `processor.py` to safely get the price using `spot_price = float(d.get("price") or d.get("index_price") or 0.0)`.
+
+7.  **Problem 22: Spot Price Still Zero & No Metrics Published (Case Sensitivity)**
+    *   **Symptom:** After fixing the key error, the `/snapshot` endpoint returned `200 OK` but with `price: 0.0` and near-zero metrics. Logs showed the collector pushing messages but no "PROCESSOR: stored ... greeks" messages, indicating the ticker branch in the processor was likely still being skipped.
+    *   **Diagnosis:** The check `ch.startswith("deribit_price_index")` was case-sensitive. Deribit likely sends the channel name with different casing (e.g., `deribit_price_index.BTC_USD`). Although the subscription in the collector *might* be case-insensitive, the *check* in the processor was failing. Because `spot_price` remained `0.0`, the processor correctly skipped calculating notionals and storing greeks (due to the `if spot_price == 0: continue` guard added earlier).
+    *   **Cause:** Case-sensitive check failing to match the actual incoming channel name for the spot price index.
+    *   **Solution:**
+        *   Modified the spot price channel check in `processor.py` to be case-insensitive: `if ch.lower().startswith("deribit_price_index"):`.
+        *   Ensured the `notional` calculation uses `spot_price` correctly and the `if spot_price == 0: continue` guard prevents processing ticks before the spot price is known.
+
+---
+
+**Current State (Pending Validation):**
+
+*   The collector connects (authenticated), subscribes to spot index and a limited set of option tickers/books.
+*   The processor attempts to parse spot index messages (now case-insensitive) and ticker messages.
+*   The processor calculates missing higher-order greeks using `bs_greeks`.
+*   The processor aggregates metrics using placeholder dealer netting (`dealer_side_mult = 1`).
+*   The processor handles potential `KeyError`s and `TypeError`s during parsing and serialization.
+*   The processor guards against division-by-zero errors.
+*   The API serves the latest processed metrics from the `dealer_metrics` Redis stream.
+*   **Expected Next Outcome:** Logs should show successful processing of both spot index and ticker messages, `PROCESSOR: stored ... greeks` messages should appear, and `/snapshot` should return JSON with a non-zero spot `price` and realistically scaled metrics (NGI, VSS, etc.).
+
+**(End of Log - Awaiting results of running the latest patched code)**
+
