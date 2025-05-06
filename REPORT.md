@@ -1,3 +1,60 @@
+**Pre-Mortem (≤120 w)**  
+• Scope creep—adding CME, order-book depth later derails MVP.  
+• Ambiguous “dashboard” definition → visual churn.  
+• Ignoring ops (secrets, CI) until late → launch delay.  
+• Misestimate Deribit bandwidth—CPU bill spikes.  
+• Back-test leakage (look-ahead) undermines Sharpe claim.  
+• ClickHouse schema drift bricks historical queries.  
+• Reliance on Deribit greeks—vendor change breaks calc.  
+• Security holes: Redis exposed, creds in repo.
+
+**Assumptions/Biases**  
+Assume BTC options stay Deribit-centric. Target user is quantitative trader comfortable with Docker. Bias toward open-source infra (Redis, ClickHouse) over managed SaaS. Incentive: hit 200 ms e2e latency—may under-invest in fault-tolerance.
+output
+Copy
+Edit
+# Dealer-Flow Stack — Project Scope v0.3
+
+## Mission
+Deliver a **real-time dealer-flow intelligence platform** for BTC options that:  
+1. Quantifies dealer hedge pressure (gamma, vanna, charm, volga).  
+2. Flags flow-driven regime states (“Gamma-Pin”, “Vanna-Squeeze”, etc.).  
+3. Feeds both a discretionary dashboard and a systematic model sleeve targeting **Sharpe > 3**.
+
+## Functional Components
+| Layer | Responsibilities | Tech |
+|-------|------------------|------|
+| **Collector** | Auth to Deribit, subscribe to option tickers & books, stream raw JSON → Redis ≤ 50 ms. | `websockets`, `aiohttp` |
+| **Processor** | Aggregate greeks, infer dealer side from OI, compute NGI/VSS/CHL/VOLG, G-Flip Δ, HPP, classify scenarios, publish metrics ≤ 150 ms. | `numba`, `pandas` |
+| **API** | Expose `/snapshot`, `/heatmap`, `/scenario` REST/WebSocket. | FastAPI |
+| **Dashboard** | Sparkline, gauges, heat-map, scenario badges; refresh 1–5 Hz. | Plotly Dash (later React) |
+| **Storage** | Hot: Redis 24 h. Warm: ClickHouse 30 d. Cold: S3 Parquet. | Redis Streams, ClickHouse |
+| **Back-test / Model** | Purged walk-forward CV, SHAP pruning, cat-boost baseline. | Jupyter, CatBoost |
+
+## Non-Functional Requirements
+* **Latency:** tick → dashboard ≤ 200 ms 95-pct.  
+* **Uptime:** 99 %. Auto-restart workers.  
+* **Security:** API keys in `.env`; Redis password + bridge network only.  
+* **Portability:** Single `docker-compose up` for full stack.  
+* **Reproducibility:** Poetry lockfile; CI builds image; ClickHouse DDL versioned.  
+
+## Deliverables & Milestones
+1. **MVP Wire-up** (DONE): collector → processor stub → `/snapshot`.  
+2. **Full Greek Roll-up**: option feed auth, filtered strike set, NGI/VSS/CHL/VOLG live.  
+3. **Dashboard v1**: real gauges + heat-map.  
+4. **Historical Backfill**: ClickHouse schema, 30 d options/OI ingest.  
+5. **Systematic Sleeve**: model notebook, walk-forward report.  
+6. **Hardening**: tests, alerts, docs, prod Helm charts.
+
+## Out-of-Scope (for v1)
+* Order-book microstructure (queue pos, depth imbalance).  
+* Non-BTC assets.  
+* CME options parity.  
+* Web-scale multi-tenant auth.
+
+
+
+
 rationale
 **Pre-Mortem (Documentation Generation, ≤120 w):**
 - Missing context: Forgetting initial setup details (macOS, Poetry, initial Dockerfile intent).

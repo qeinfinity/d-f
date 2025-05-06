@@ -19,6 +19,7 @@ publishes roll-ups every second to `dealer_metrics`.
 import asyncio, time, orjson, pandas as pd, numpy as np, sys
 import datetime as dt, calendar
 import re, datetime as dt, calendar
+import logging
 from collections import deque, defaultdict
 from dealer_flow.redis_stream import get_redis, STREAM_KEY_RAW, STREAM_KEY_METRICS
 from dealer_flow.gamma_flip import gamma_flip_distance
@@ -32,6 +33,7 @@ BLOCK_MS = 200
 ROLL_FREQ = 1.0  # s
 _DATE_RE = re.compile(r"(\d{1,2})([A-Z]{3})(\d{2})")  # day, month, yy
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # in-memory state
 greek_store = {}        # inst -> dict(gamma, vanna, charm, volga, OI)
@@ -65,8 +67,15 @@ async def maybe_publish(redis):
         .mul(signed["dealer_side_mult"], axis=0)
     )
     agg = roll_up(signed)
-    flip = gamma_flip_distance(pd.Series(gamma_by_strike), prices[-1])
-    payload = {"ts": now, "price": prices[-1], "msg_rate": len(tick_times), **agg, "flip_pct": flip}
+    spot_val = spot[0] or (prices[-1] if prices else 0.0)
+    flip = gamma_flip_distance(pd.Series(gamma_by_strike), spot_val)
+    payload = {
+        "ts": now,
+        "price": spot_val,
+        "msg_rate": len(tick_times),
+        **agg,
+        "flip_pct": flip,
+    }
     await redis.xadd(
         STREAM_KEY_METRICS,
         {"d": orjson.dumps(payload, option=JSON_OPTS)}
@@ -102,10 +111,20 @@ async def processor():
                         params = j.get("params", {})
                         ch, d = params.get("channel"), params.get("data")
                         if not isinstance(d, dict):
-                            continue
-                        if ch.startswith("deribit_price_index"):
-                            # Deribit returns {"price": <float>, ...}
-                            spot_price = float(d.get("price") or d.get("index_price"))
+                            continue                        
+                        # ------------ SPOT INDEX (robust) ---------------
+                        if ch and ch.lower().startswith("deribit_price_index"):
+                            spot_val = None
+                            try:
+                                spot_val = float(d.get("price") or d.get("index_price") or 0)
+                            except (TypeError, ValueError):
+                                logging.warning("Bad index payload %s", d)
+                            if not spot_val:
+                                continue
+
+                            if spot_val > 0:
+                                spot[0] = spot_val
+                                prices.append(spot_val)
                             continue
                         if ch.startswith("ticker"):
                             mark = float(d["mark_price"])
@@ -118,7 +137,8 @@ async def processor():
                             T = max((expiry_ts - now_ts), 0.0) / (365 * 24 * 3600)
 
                             size  = d["open_interest"]        # contracts
-                            notional = size * (spot[0] or mark)
+    
+                            notional = size * (spot[0] or mark)         
 
                             deriv_greeks = d.get("greeks", {})
                             gamma = deriv_greeks.get("gamma", 0.0)
@@ -161,6 +181,13 @@ async def processor():
                                 print(f"PROCESSOR: stored {len(greek_store)} greeks",
                                       file=sys.stderr)
                         tick_times.append(time.time())
+                        logging.debug(
+                            "ticker %s spot=%.2f mark=%.2f gamma=%.3g",
+                            inst,
+                            spot[0],
+                            mark,
+                            gamma,
+                        )
                     except Exception as e:
                         print(f"PARSE ERR {e}", file=sys.stderr)
         now = time.time()
