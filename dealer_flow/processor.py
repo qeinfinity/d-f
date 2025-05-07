@@ -24,6 +24,8 @@ from collections import deque, defaultdict
 from dealer_flow.redis_stream import get_redis, STREAM_KEY_RAW, STREAM_KEY_METRICS
 from dealer_flow.gamma_flip import gamma_flip_distance
 from dealer_flow.vanna_charm_volga import roll_up
+from dealer_flow.hpp_score import hpp
+from dealer_flow.rules import classify
 from dealer_flow.dealer_net import infer_dealer_net
 from dealer_flow.greek_calc import greeks as bs_greeks   # NEW
 
@@ -40,7 +42,10 @@ greek_store = {}        # inst -> dict(gamma, vanna, charm, volga, OI)
 gamma_by_strike = {}    # strike -> net dealer gamma
 prices = deque(maxlen=1)
 tick_times = deque(maxlen=1000)
+
+# mutable globals
 spot = [0.0]
+last_pub_price = [0.0]   # for spot-change sign
 
 async def ensure_group(r):
     try:
@@ -69,12 +74,21 @@ async def maybe_publish(redis):
     agg = roll_up(signed)
     spot_val = spot[0] or (prices[-1] if prices else 0.0)
     flip = gamma_flip_distance(pd.Series(gamma_by_strike), spot_val)
+    if spot_val <= 0 or last_pub_price[0] <= 0:
+        return            # skip publish until we have a real spot
+    # -------------------- HPP & scenario --------------------
+    spot_move_sign = 1 if spot_val > last_pub_price[0] else -1 if spot_val < last_pub_price[0] else 0
+    HPP_val = hpp(spot_move_sign, agg["NGI"], agg["VSS"], agg["CHL_24h"])
+    scenario = classify(agg | {"HPP": HPP_val}, adv_usd=abs(agg["NGI"]) * 10, spot_change_pct=(spot_val / (last_pub_price[0] or spot_val) - 1))
+    last_pub_price[0] = spot_val
     payload = {
         "ts": now,
         "price": spot_val,
         "msg_rate": len(tick_times),
         **agg,
         "flip_pct": flip,
+        "HPP": HPP_val,
+        "scenario": scenario,
     }
     await redis.xadd(
         STREAM_KEY_METRICS,
@@ -141,12 +155,12 @@ async def processor():
                             notional = size * (spot[0] or mark)         
 
                             deriv_greeks = d.get("greeks", {})
-                            gamma = deriv_greeks.get("gamma", 0.0)
+                            gamma = deriv_greeks.get("gamma") or 0.0
 
                             # If vanna/charm/volga missing → compute
-                            vanna  = deriv_greeks.get("vanna")
-                            charm  = deriv_greeks.get("charm")
-                            volga  = deriv_greeks.get("volga")
+                            vanna = deriv_greeks.get("vanna")
+                            charm = deriv_greeks.get("charm")
+                            volga = deriv_greeks.get("volga")
 
                             if None in (vanna, charm, volga):
                                 sigma = d.get("mark_iv", 0) / 100  # iv in pct
@@ -158,12 +172,15 @@ async def processor():
                                 else:
                                     S = np.array([mark])
                                     K = np.array([strike])
-                                    g, v, c, vg = bs_greeks(
+                                    _g, v, c, vg = bs_greeks(
                                         S, K, np.array([T]), 0.0, np.array([sigma]), np.array([1])
                                     )
-                                    vanna = vanna or float(v[0])
-                                    charm = charm or float(c[0])
-                                    volga = volga or float(vg[0])
+                                    if vanna is None:
+                                        vanna = float(v[0])
+                                    if charm is None:
+                                        charm = float(c[0])
+                                    if volga is None:
+                                        volga = float(vg[0])
 
                             greeks = {
                                 "gamma": gamma,
@@ -172,6 +189,7 @@ async def processor():
                                 "volga": volga,
                                 "notional_usd": notional,
                                 "strike": strike,
+                                # signed later
                             }
                             greek_store[inst] = greeks
                             gamma_by_strike[strike] = (

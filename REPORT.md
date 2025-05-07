@@ -304,3 +304,66 @@ output
 
 **(End of Log - Awaiting results of running the latest patched code)**
 
+
+## Dealer-Flow Stack: Troubleshooting Log & Maintainer Guide (Continuation)
+
+**Previous State:** The processor was logging `PARSE ERR local variable 'spot_val' referenced before assignment` for initial ticks, and metrics VSS, CHL_24h, VOLG were zero in the `/snapshot` output. The "PROCESSOR: stored ... greeks" log was not appearing.
+
+---
+
+**Phase 7: Refining Processor Logic & Finalizing MVP Metrics**
+
+1.  **Problem 23: `spot_val` UnboundLocalError in Ticker Logging & VSS/CHL/VOLG Zeros**
+    *   **Symptom (User Confirmed):** Initial `PARSE ERR local variable 'spot_val' referenced before assignment` errors appeared, followed by `PROCESSOR: ticker ...` logs showing the correct spot price. The `/snapshot` endpoint returned data with `price`, `NGI`, `flip_pct` populated, but `VSS`, `CHL_24h`, `VOLG` were `0.0`. The `PROCESSOR: stored ... greeks` log was not appearing.
+    *   **Diagnosis (System Analysis):**
+        *   **`spot_val` Logging Error:** The debug print statement `print(f"PROCESSOR: ticker {inst} spot={spot_val}", file=sys.stderr)` inside the *ticker processing block* (`if ch.startswith("ticker"):`) correctly used the *local* `spot_val` (which was only defined in the *price index* block: `if ch and ch.lower().startswith("deribit_price_index"):`). When a ticker message arrived *before* any price index message, this local `spot_val` was indeed unassigned in the ticker block's scope, leading to the `UnboundLocalError` caught by the general `except Exception as e:`. Once a price index message arrived, the *global* `spot = [0.0]` was updated. Subsequent ticker messages *would* have failed if they tried to use a local `spot_val`. The provided diff correctly changed the `spot_price` variable (used for the global `spot` list) to `spot_val` locally *within the spot index branch only*. The debug print in the ticker branch should use the global `spot[0]`.
+        *   **Zero VSS/CHL/VOLG:** The `processor.py` logic: `vanna = deriv_greeks.get("vanna")` (and similar for charm, volga) would assign `None` if these keys weren't in Deribit's payload (which they aren't for standard ticker messages). The subsequent `if None in (vanna, charm, volga):` block *correctly* triggered the fallback to `bs_greeks`. However, the `else:` block inside this condition (which would assign `vanna = vanna or 0.0`) was only hit if `sigma <= 0 or T <= 0`. If `sigma` and `T` *were* valid, but `bs_greeks` returned, say, `v[0]` as a non-None value (e.g., a valid float), then `vanna = vanna or float(v[0])` would evaluate to `vanna = None or <calculated_float>`, resulting in `vanna = <calculated_float>`. The issue wasn't that they were *always* zero, but that the `/snapshot` might have been hit when `greek_store` was still small, and perhaps those initial items had `sigma` or `T` as zero, or `bs_greeks` legitimately calculated zero for those specific inputs. The core logic to calculate them was present.
+        *   **Missing "stored greeks" log:** This was due to a combination of the `MAX_UNAUTH_STRIKES = 12` in `deribit_ws.py` (limiting the number of unique instruments) and the `if len(greek_store) % 1000 == 0:` threshold. The system simply wasn't processing 1000 unique instruments quickly enough with the limited subscription set.
+    *   **Cause:** Scoping error in a debug print statement. Greeks defaulting to zero under certain initial conditions or if `bs_greeks` calculates zero. High threshold for a progress log.
+    *   **Solution (Applied in Patches & Analysis):**
+        *   The `spot_val` print issue was addressed by changing the debug print to `logging.debug("ticker %s spot=%.2f mark=%.2f gamma=%.3g", inst, spot[0], mark, gamma)`. This uses the global `spot[0]`.
+        *   The VSS/CHL/VOLG zeros were not due to a fundamental flaw in *not* calling `bs_greeks`, but rather that `bs_greeks` *was* being called, and for initial ticks or certain parameter combinations, it could legitimately return zero, or the `mark_iv`/`T` could be zero, leading to the `0.0` defaults. The patch provided by the system (which you confirmed by applying your full `processor.py`) ensured that `vanna`, `charm`, `volga` are *always* assigned the result of `bs_greeks` if they were initially `None` and if `sigma` and `T` are valid:
+            ```python
+            # ...
+            if None in (vanna, charm, volga):
+                sigma = d.get("mark_iv", 0) / 100
+                if sigma <= 0 or T <= 0:
+                    vanna = vanna or 0.0 # If already None, becomes 0.0
+                    charm = charm or 0.0
+                    volga = volga or 0.0
+                else:
+                    # ... bs_greeks calculation ...
+                    vanna = float(v[0]) # Direct assignment, not "vanna or float(v[0])"
+                    charm = float(c[0])
+                    volga = float(vg[0])
+            # ...
+            ```
+            This change ensures `vanna`, `charm`, `volga` are populated with the calculated values from `bs_greeks` when inputs are valid, rather than potentially remaining `0.0` if their `deriv_greeks.get()` was `None` but `bs_greeks` would have produced a non-zero result.
+        *   The "stored greeks" log threshold was recommended to be lowered (e.g., to `% 100`) for better visibility during testing with limited instruments.
+
+2.  **Problem 23 (Cont.): Implementing Full Greek Roll-up for Milestone 2**
+    *   **Context:** `/snapshot` now returned price, NGI, and flip_pct, but VSS, CHL_24h, and VOLG were still 0.0. The next step was to fully implement Milestone 2.
+    *   **User Action:** The user confirmed readiness to implement the "Road-map to Milestone 2 'Full Greek Roll-up' spec."
+    *   **Diagnosis (System Analysis):** The system identified that VSS/CHL/VOLG were zero because the `bs_greeks` calculation (triggered when Deribit doesn't provide these greeks) might still result in zeros for initial ticks if `mark_iv` or Time-to-Expiry (`T`) were zero or invalid. The key was to ensure that `vanna`, `charm`, and `volga` in the `greeks` dictionary are *always* populated from the output of `bs_greeks` when Deribit doesn't supply them and when inputs to `bs_greeks` (S, K, T, r, sigma) are valid. Additionally, the HPP and scenario classification were missing from the payload.
+    *   **Solution (Provided as a diff by the system):**
+        *   **`dealer_flow/vanna_charm_volga.py`:** Corrected the scaling for `VSS` and `VOLG` to use `spot_pct` (consistent with NGI if NGI represents a % move sensitivity) and clarified comments.
+        *   **`dealer_flow/processor.py`:**
+            *   Imported `hpp_score` and `rules`.
+            *   Added `last_pub_price = [0.0]` global to track spot price changes for `spot_move_sign`.
+            *   In `maybe_publish()`:
+                *   Calculated `spot_move_sign`.
+                *   Called `hpp_score.hpp(...)` to get `HPP_val`.
+                *   Called `rules.classify(...)` to get `scenario`.
+                *   Added `HPP` and `scenario` to the payload.
+                *   Updated `last_pub_price[0] = spot_val`.
+            *   In the ticker processing block: Ensured `gamma` defaults to `0.0` if missing. Crucially, ensured that if `vanna`, `charm`, or `volga` are `None` (i.e., not provided by Deribit), they are *directly assigned* the calculated values from `bs_greeks` (e.g., `vanna = float(v[0])`) rather than `vanna = vanna or float(v[0])`, which would keep them as `0.0` if they were initialized to `0.0` and `bs_greeks` returned `0.0`.
+    *   **Current Unsolved State (as per last user log):**
+        *   The logs `PARSE ERR local variable 'spot_val' referenced before assignment` are still appearing for the initial few messages.
+        *   The "PROCESSOR: stored ... greeks" message is not appearing, but "COLLECTOR: pushed ... msgs" is.
+        *   The `/snapshot` endpoint *is* returning `200 OK` with a JSON payload that includes `price`, `NGI`, `VSS`, `CHL_24h`, `VOLG`, and `flip_pct`. However, while `price`, `NGI`, and `flip_pct` seem to have reasonable values (e.g., `price: 96050.38`), the `VSS`, `CHL_24h`, and `VOLG` are still `0.0`. This indicates that either the conditions `sigma <= 0 or T <= 0` are frequently true for the initial set of instruments, or `bs_greeks` is legitimately calculating zeros for these higher-order greeks based on the initial market data, or the `greeks` dictionary update from `bs_greeks` output is not correctly populating these values before they are summed in `roll_up`.
+
+---
+
+**(End of Log - Awaiting resolution for Problem 23 (Cont.): Zero VSS/CHL/VOLG despite `bs_greeks` call, and persistent `spot_val` UnboundLocalError in initial logs. The "PROCESSOR: stored ... greeks" log also remains elusive.)**
+
+
