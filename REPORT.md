@@ -371,7 +371,9 @@ output
 
 
 
-dealer_net.py placeholdeDealer Netting Simplification: dealer_net.py uses a placeholder logic. Accurately determining the net dealer position (customer shorts vs. customer longs) is complex and crucial for correct metric interpretation. The current assumption of dealer_side_mult = 1 means all OI is treated as if dealers need to hedge it by taking the opposite side of a customer's vanilla position.r methodology. need something more sophisticated
+dealer_net.py placeholdeDealer Netting Simplification: dealer_net.py uses a placeholder logic. Accurately determining the net dealer position (customer shorts vs. customer longs) is complex and crucial for correct metric interpretation. The current assumption of dealer_side_mult = 1 means all OI is treated as if dealers need to hedge it by taking the opposite side of a customer's vanilla position. need something more sophisticated
+
+Raw Gamma for Flip Point: gamma_flip_distance currently uses a gamma_by_strike sum based on raw instrument gammas, not dealer-netted gammas. The true flip point would depend on the net dealer exposure.
 
 CHL_24h (Charm Load): sum(signed_charm * notional_usd * (1/365)). (Note: vanna_charm_volga.py uses 24/365 which is incorrect, should be 1/365 for daily charm impact or scale by T properly). The current code uses * 24/365, which seems to imply daily charm, but charm is dDelta/dTime, so multiplying by 1 day's fraction of a year is typical. Needs verification for the exact interpretation of "daily charm load". The code in vanna_charm_volga.py is dealer_greeks["charm"] * 24 / 365 * dealer_greeks["notional_usd"]. This is likely intended as "delta change per day".
 
@@ -379,9 +381,10 @@ Scenario: A qualitative label ("Gamma Pin," "Dealer Sell Material," etc.) determ
 
 Limited Instrument Set: The collector currently only subscribes to MAX_UNAUTH_STRIKES (12) option instruments due to a "crude filter." This is a very small fraction of the market and will significantly underrepresent total dealer exposure.
 
-BS Model & Inputs: Relies on the Black-Scholes model. Assumes risk-free rate r=0. Implied Volatility (mark_iv) is taken from Deribit's ticker data. The accuracy of calculated greeks depends heavily on these inputs. The option_type for BS calculation is inferred from instrument name (e.g., "-C-" for Call, "-P-" for Put).
 
-Raw Gamma for Flip Point: gamma_flip_distance currently uses a gamma_by_strike sum based on raw instrument gammas, not dealer-netted gammas. The true flip point would depend on the net dealer exposure.
+
+
+
 
 Static Thresholds/Weights: HPP score weights (alpha, beta) and scenario classification rules use static thresholds. In a real system, these might need to be dynamic or adaptive. adv_usd for scenario classification is a placeholder.
 
@@ -391,3 +394,7 @@ Basic Error Handling in WS/Processor: While try-except blocks exist, the resilie
 
 Single spot[0] Source: Relies on a single Deribit index for spot price.
 
+BS Model & Inputs: Relies on the Black-Scholes model. Assumes risk-free rate r=0. Implied Volatility (mark_iv) is taken from Deribit's ticker data. The accuracy of calculated greeks depends heavily on these inputs. The option_type for BS calculation is inferred from instrument name (e.g., "-C-" for Call, "-P-" for Put).
+
+
+*Must incorporate Block trades, OTC data, CME data etc* 
