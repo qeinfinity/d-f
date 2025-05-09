@@ -67,126 +67,94 @@ async def auth_token():
     logger.info("Auth OK") # This is appearing in your logs
     return token, time.time() + TOKEN_TTL
 
+# dealer_flow/deribit_ws.py
+
+# ... (imports and other functions remain the same) ...
+# Ensure logger is set up as in the previous patch (DEBUG level)
+
 async def current_instruments(is_authenticated: bool):
     logger.info(f"Entering current_instruments. is_authenticated: {is_authenticated}")
-    print(f"DEBUG_PRINT: Entering current_instruments. is_authenticated: {is_authenticated}", file=sys.stderr)
-    sys.stderr.flush()
-
+    # print(f"DEBUG_PRINT: Entering current_instruments. is_authenticated: {is_authenticated}", file=sys.stderr); sys.stderr.flush()
 
     instruments_url = f"{settings.deribit_rest}/public/get_instruments"
     params=dict(currency=settings.currency, kind="option", expired="false")
     logger.debug(f"Fetching instruments from URL: {instruments_url} with params: {params}")
-    print(f"DEBUG_PRINT: Fetching instruments from URL: {instruments_url} with params: {params}", file=sys.stderr)
-    sys.stderr.flush()
+    # print(f"DEBUG_PRINT: Fetching instruments from URL: {instruments_url} with params: {params}", file=sys.stderr); sys.stderr.flush()
 
-
-    data = [] # Initialize data to ensure it's always a list
-
+    api_data_result = [] # Initialize to ensure it's a list
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.get(instruments_url, params=params, timeout=20) as r:
                 logger.debug(f"get_instruments HTTP status: {r.status}")
-                print(f"DEBUG_PRINT: get_instruments HTTP status: {r.status}", file=sys.stderr)
-                sys.stderr.flush()
-
-                response_text_snippet = await r.text() # Get text for logging in case of errors
-                response_text_snippet = response_text_snippet[:500] # Limit snippet size
+                # print(f"DEBUG_PRINT: get_instruments HTTP status: {r.status}", file=sys.stderr); sys.stderr.flush()
+                response_text_snippet = await r.text()
+                response_text_snippet = response_text_snippet[:500]
 
                 if r.status != 200:
                     logger.error(f"HTTP error fetching instruments: {r.status}. Response: {response_text_snippet}")
-                    print(f"DEBUG_PRINT: HTTP error fetching instruments: {r.status}. Response: {response_text_snippet}", file=sys.stderr)
-                    sys.stderr.flush()
-                    return [] # Return empty on HTTP error
-
+                    return [] 
                 try:
-                    json_response = await r.json(content_type=None) # Try to force parse if content_type is odd
+                    json_response = await r.json(content_type=None)
                     logger.debug(f"get_instruments JSON response (first 200 chars): {str(json_response)[:200]}")
-                    print(f"DEBUG_PRINT: get_instruments JSON response (first 200 chars): {str(json_response)[:200]}", file=sys.stderr)
-                    sys.stderr.flush()
-                    data = json_response.get("result", [])
-                    if not isinstance(data, list):
-                        logger.error(f"API 'result' for get_instruments is not a list. Type: {type(data)}. Payload: {str(json_response)[:500]}")
-                        print(f"DEBUG_PRINT: API 'result' for get_instruments is not a list. Type: {type(data)}. Payload: {str(json_response)[:500]}", file=sys.stderr)
-                        sys.stderr.flush()
-                        data = [] # Ensure data is a list
+                    api_data_result = json_response.get("result", []) # Assign to api_data_result
+                    if not isinstance(api_data_result, list):
+                        logger.error(f"API 'result' for get_instruments is not a list. Type: {type(api_data_result)}. Payload: {str(json_response)[:500]}")
+                        api_data_result = []
                 except json.JSONDecodeError as json_err:
                     logger.error(f"JSON decode error fetching instruments: {json_err}. Response text: {response_text_snippet}", exc_info=True)
-                    print(f"DEBUG_PRINT: JSON decode error fetching instruments: {json_err}. Response text: {response_text_snippet}", file=sys.stderr)
-                    sys.stderr.flush()
-                    return [] # Return empty on JSON error
-    except aiohttp.ClientConnectorError as e:
-        logger.error(f"ClientConnectorError fetching instruments: {e}", exc_info=True)
-        print(f"DEBUG_PRINT: ClientConnectorError fetching instruments: {e}", file=sys.stderr)
-        sys.stderr.flush()
-        return []
-    except asyncio.TimeoutError:
-        logger.error("TimeoutError fetching instruments.", exc_info=True)
-        print("DEBUG_PRINT: TimeoutError fetching instruments.", file=sys.stderr)
-        sys.stderr.flush()
-        return []
+                    return []
     except Exception as e:
         logger.error(f"Generic error during instrument fetch API call: {e}", exc_info=True)
-        print(f"DEBUG_PRINT: Generic error during instrument fetch API call: {e}", file=sys.stderr)
-        sys.stderr.flush()
         return []
 
-    logger.info(f"Raw data fetched, count: {len(data)}. First item if any: {str(data[0])[:200] if data else 'N/A'}")
-    print(f"DEBUG_PRINT: Raw data fetched, count: {len(data)}. First item if any: {str(data[0])[:200] if data else 'N/A'}", file=sys.stderr)
-    sys.stderr.flush()
+    logger.info(f"Raw instrument data fetched from API, count: {len(api_data_result)}. First item if any: {str(api_data_result[0])[:200] if api_data_result else 'N/A'}")
+    # print(f"DEBUG_PRINT: Raw data fetched, count: {len(api_data_result)}. First item if any: {str(api_data_result[0])[:200] if api_data_result else 'N/A'}", file=sys.stderr); sys.stderr.flush()
 
+    selected_instrument_names = []
+
+    if not api_data_result: # Check if api_data_result is empty
+        logger.warning("No instrument data received from API's 'result' field or API call failed.")
+        return []
+
+    # Filter for items that are dicts and have 'instrument_name'
+    # The /public/get_instruments endpoint DOES NOT contain 'open_interest'
+    # So we cannot filter or sort by it here.
+    
+    valid_items_with_name = []
+    for idx, d_item in enumerate(api_data_result): # Iterate over api_data_result
+        if not isinstance(d_item, dict):
+            logger.warning(f"Item {idx} in instrument data is not a dict: {str(d_item)[:100]}")
+            continue
+        if "instrument_name" in d_item:
+            valid_items_with_name.append(d_item)
+        else:
+            logger.debug(f"Filtering out instrument because it's missing 'instrument_name': {str(d_item)[:100]}")
+
+    logger.info(f"Found {len(valid_items_with_name)} instruments with an 'instrument_name' field from the API response.")
+    # print(f"DEBUG_PRINT: Found {len(valid_items_with_name)} instruments with an 'instrument_name' field.", file=sys.stderr); sys.stderr.flush()
+            
+    if not valid_items_with_name:
+        logger.warning("No instruments with 'instrument_name' found after basic validation. Returning empty list.")
+        # print("DEBUG_PRINT: No instruments with 'instrument_name' found. Returning empty list.", file=sys.stderr); sys.stderr.flush()
+        return []
 
     if not is_authenticated:
-        logger.info(f"UNAUTH mode: Selecting up to {MAX_UNAUTH_STRIKES} instruments from {len(data)} fetched (Deribit default sort).")
-        print(f"DEBUG_PRINT: UNAUTH mode: Selecting up to {MAX_UNAUTH_STRIKES} instruments from {len(data)} fetched.", file=sys.stderr)
-        sys.stderr.flush()
-        selected_instruments = [d["instrument_name"] for d in data[:MAX_UNAUTH_STRIKES] if "instrument_name" in d]
-    else:
-        logger.info(f"AUTH mode: Processing {len(data)} fetched instruments.")
-        print(f"DEBUG_PRINT: AUTH mode: Processing {len(data)} fetched instruments.", file=sys.stderr)
-        sys.stderr.flush()
-        
-        valid_data_for_oi_sort = []
-        for idx, d_item in enumerate(data):
-            if not isinstance(d_item, dict):
-                logger.warning(f"Item {idx} in instrument data is not a dict: {str(d_item)[:100]}")
-                continue
-            if "open_interest" not in d_item:
-                logger.debug(f"Item {d_item.get('instrument_name', 'N/A')} missing 'open_interest'. OI: {d_item.get('open_interest')}")
-            if isinstance(d_item.get("open_interest"), (int, float)) and "instrument_name" in d_item:
-                valid_data_for_oi_sort.append(d_item)
-            else:
-                logger.debug(f"Filtering out instrument due to missing OI/name or invalid OI type: {str(d_item)[:100]}")
-        
-        logger.info(f"Found {len(valid_data_for_oi_sort)} instruments with valid numeric 'open_interest' and 'instrument_name'.")
-        print(f"DEBUG_PRINT: Found {len(valid_data_for_oi_sort)} instruments with valid OI and name.", file=sys.stderr)
-        sys.stderr.flush()
+        logger.info(f"UNAUTH mode: Selecting up to {MAX_UNAUTH_STRIKES} instruments from {len(valid_items_with_name)} valid fetched items (Deribit default sort).")
+        # print(f"DEBUG_PRINT: UNAUTH mode: Selecting up to {MAX_UNAUTH_STRIKES} from {len(valid_items_with_name)}.", file=sys.stderr); sys.stderr.flush()
+        selected_instrument_names = [d["instrument_name"] for d in valid_items_with_name[:MAX_UNAUTH_STRIKES]]
+    else: # Authenticated mode
+        max_instruments_to_subscribe = settings.deribit_max_auth_instruments
+        logger.info(f"AUTH mode: Selecting up to {max_instruments_to_subscribe} instruments from {len(valid_items_with_name)} valid fetched items (Deribit default sort).")
+        # print(f"DEBUG_PRINT: AUTH mode: Selecting up to {max_instruments_to_subscribe} from {len(valid_items_with_name)}.", file=sys.stderr); sys.stderr.flush()
+        selected_instrument_names = [d["instrument_name"] for d in valid_items_with_name[:max_instruments_to_subscribe]]
 
-        if not valid_data_for_oi_sort:
-            logger.warning("No valid instruments found after filtering for OI and name. Returning empty list.")
-            print("DEBUG_PRINT: No valid instruments found after filtering for OI and name. Returning empty list.", file=sys.stderr)
-            sys.stderr.flush()
-            return []
+    logger.info(f"Exiting current_instruments, selected {len(selected_instrument_names)} instruments for subscription.")
+    # print(f"DEBUG_PRINT: Exiting current_instruments, returning {len(selected_instrument_names)} instruments.", file=sys.stderr); sys.stderr.flush()
+    return selected_instrument_names
 
-        try:
-            sorted_by_oi = sorted(valid_data_for_oi_sort, key=lambda x: x.get("open_interest", 0.0), reverse=True)
-        except Exception as e:
-            logger.error(f"Error sorting instruments by OI: {e}", exc_info=True)
-            print(f"DEBUG_PRINT: Error sorting instruments by OI: {e}", file=sys.stderr)
-            sys.stderr.flush()
-            # Fallback to unsorted valid data if sorting fails
-            sorted_by_oi = valid_data_for_oi_sort 
+# ... (rest of deribit_ws.py, including the run function, remains the same as the previous good version) ...
+# Make sure the logger setup at the top of the file is also present.
 
-        max_instruments_to_subscribe = settings.deribit_max_auth_instruments # Assumes this is now in Settings
-        
-        selected_instruments = [d["instrument_name"] for d in sorted_by_oi[:max_instruments_to_subscribe]]
-        logger.info(f"Selected top {len(selected_instruments)} instruments by OI (max config: {max_instruments_to_subscribe}).")
-        print(f"DEBUG_PRINT: Selected top {len(selected_instruments)} instruments by OI (max config: {max_instruments_to_subscribe}).", file=sys.stderr)
-        sys.stderr.flush()
-
-    logger.info(f"Exiting current_instruments, returning {len(selected_instruments)} instruments.")
-    print(f"DEBUG_PRINT: Exiting current_instruments, returning {len(selected_instruments)} instruments.", file=sys.stderr)
-    sys.stderr.flush()
-    return selected_instruments
 
 async def run():
     # ... (ensure redis connection and wait_for_redis as before)
