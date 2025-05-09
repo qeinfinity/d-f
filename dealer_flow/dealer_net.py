@@ -1,25 +1,27 @@
-"""
-Infers dealer sign (MM vs customer) from open interest.
-Assume dealer net pos = -customer_net_pos.
-"""
+# dealer_flow/dealer_net.py
 import pandas as pd
 import numpy as np
+import logging
+
+logger = logging.getLogger(__name__)
 
 def infer_dealer_net(oi_df: pd.DataFrame) -> pd.DataFrame:
     """
-    oi_df may contain:
-        ['instrument', 'gamma', 'vanna', 'charm', 'volga', 'notional_usd', ...]
-    Optionally:
-        ['side'] with values like 'call_long', 'call_short', etc.
+    Infers dealer sign (MM vs customer) from open interest.
+    ASSUMPTION (v0.3): Without actual trade flow data, this is a major simplification.
+    The 'side' column is NOT currently populated by the processor from ticker/book data.
+    Therefore, 'dealer_side_mult' defaults to 1, assuming all OI represents
+    positions that dealers would need to hedge as if they were short gamma against them
+    (e.g., customer is long the option).
 
-    Returns same DF with a 'dealer_side_mult' column (1 or -1).
+    A more sophisticated model would require trade data analysis.
     """
-    if "side" in oi_df.columns:
+    if "side" in oi_df.columns and not oi_df["side"].empty: # Check if 'side' actually has data
+        logger.info("Attempting dealer netting using 'side' column.")
         oi_df["dealer_side_mult"] = np.where(
-            oi_df["side"].str.contains("short"), 1, -1
-        )
+            oi_df["side"].str.contains("short", case=False, na=False), 1, -1
+        ) # Assuming 'short' in side means customer is short, dealer is long. Adjust if interpretation differs.
     else:
-        # no side info yet – assume dealer needs to hedge ALL customer gamma
+        logger.debug("No 'side' column in OI data or it's empty; defaulting dealer_side_mult to 1 (assume dealer short gamma exposure on all OI).")
         oi_df["dealer_side_mult"] = 1
-
     return oi_df

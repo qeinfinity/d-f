@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://:changeme@redis:6379/0"
 
+    deribit_max_auth_instruments: int = 100
+
     # General
     currency: str = "BTC"
 
