@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # General
     currency: str = "BTC"
 
+    clickhouse_user: str = "default"
+    clickhouse_password: str = ""
+    clickhouse_db_name: str = "dealer_flow"
+
     class Config:
         env_file = Path(__file__).parent.parent / ".env"
 

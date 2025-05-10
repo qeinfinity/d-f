@@ -1,265 +1,328 @@
 # dealer_flow/deribit_ws.py
 import asyncio, json, time, uuid, aiohttp, websockets, orjson, sys
 import logging
-from dealer_flow.config import settings # Make sure settings is imported
-from dealer_flow.redis_stream import get_redis, STREAM_KEY_RAW
+from dealer_flow.config import settings
+from dealer_flow.redis_stream import get_redis, STREAM_KEY_RAW # Keep for raw ticker data
+# New stream key for book summaries
+STREAM_KEY_BOOK_SUMMARIES_FEED = "deribit_book_summaries_feed"
 
-# This basicConfig should apply since this script is run as __main__ for the collector process
-if __name__ == "__main__" and not logging.getLogger().hasHandlers(): # Ensure basicConfig is only called once
-    logging.basicConfig(
-        level=logging.DEBUG, # <--- SET TO DEBUG for more verbosity
-        format="%(asctime)s %(levelname)s %(name)s:%(lineno)d - COLLECTOR: %(message)s" # Add COLLECTOR prefix
-    )
+
+if __name__ == "__main__": # BasicConfig for standalone execution
+    if not logging.getLogger().hasHandlers():
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s %(levelname)s %(name)s:%(lineno)d - COLLECTOR: %(message)s"
+        )
 logger = logging.getLogger(__name__)
 
 TOKEN_TTL = 23 * 3600
-MAX_UNAUTH_STRIKES = 12 # For unauthenticated mode
 
-# This should be in config.py and .env / .env.example
-# For now, if not in settings, we'll use a default here to ensure code runs.
-# Ideally: DERIBIT_MAX_AUTH_INSTRUMENTS = 100 in config.py (loaded from .env)
-DEFAULT_MAX_AUTH_INSTRUMENTS = 100
-
-
+# --- Auth Token (remains largely the same, ensure logging) ---
 async def auth_token():
-    # Add some debug logging for settings
     logger.debug(f"Attempting auth. DERIBIT_ID set: {bool(settings.deribit_id)}, DERIBIT_SECRET set: {bool(settings.deribit_secret)}")
     if not (settings.deribit_id and settings.deribit_secret):
-        logger.warning("Creds absent or incomplete (ID or Secret missing) → unauth mode")
+        logger.warning("Creds absent or incomplete → unauth mode")
         return None, 0
-    
-    # Ensure URL is correct
     auth_url = f"{settings.deribit_rest}/public/auth"
     logger.debug(f"Auth URL: {auth_url}")
-
-    async with aiohttp.ClientSession() as sess:
-        try:
-            r = await sess.get(
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(
                 auth_url,
-                params={
-                    "grant_type": "client_credentials",
-                    "client_id": settings.deribit_id,
-                    "client_secret": settings.deribit_secret,
-                },
+                params={"grant_type": "client_credentials", "client_id": settings.deribit_id, "client_secret": settings.deribit_secret},
                 timeout=10,
-            )
-            # Check HTTP status for auth call itself
-            if r.status != 200:
-                logger.error(f"Auth HTTP error - Status: {r.status}, Response: {await r.text()[:200]} → unauth mode")
-                return None, 0
-            j = await r.json()
-        except aiohttp.ClientConnectorError as e:
-            logger.error(f"Auth HTTP connection error: {e} → unauth mode", exc_info=True)
-            return None, 0
-        except Exception as e:
-            logger.error(f"Auth generic error: {e} → unauth mode", exc_info=True)
-            return None, 0
+            ) as r:
+                if r.status != 200:
+                    logger.error(f"Auth HTTP error - Status: {r.status}, Response: {await r.text()[:200]} → unauth mode")
+                    return None, 0
+                j = await r.json()
+    except Exception as e:
+        logger.error(f"Auth generic error: {e} → unauth mode", exc_info=True)
+        return None, 0
 
     if "error" in j:
         logger.error(f"Auth rejected by API: {j.get('error_description', j['error'])} → unauth mode")
         return None, 0
-    
     token = j.get("result", {}).get("access_token")
     if not token:
         logger.error(f"Auth response OK but no access_token in result {j} → unauth mode")
         return None, 0
-
-    logger.info("Auth OK") # This is appearing in your logs
+    logger.info("Auth OK")
     return token, time.time() + TOKEN_TTL
 
-# dealer_flow/deribit_ws.py
+# --- WebSocket Message Sending Utilities ---
+async def send_ws_message(ws, method, params=None):
+    msg_id = str(uuid.uuid4())
+    req = {"jsonrpc": "2.0", "id": msg_id, "method": method}
+    if params:
+        req["params"] = params
+    raw_req = orjson.dumps(req)
+    logger.debug(f"> WS SEND ({method}, id:{msg_id}): {raw_req.decode()[:200]}") # Log message type
+    await ws.send(raw_req)
+    # TODO: Optionally, could implement logic to wait for and match response by ID for critical messages
 
-# ... (imports and other functions remain the same) ...
-# Ensure logger is set up as in the previous patch (DEBUG level)
+async def subscribe_channels(ws, channels):
+    if not channels:
+        logger.warning("Subscribe called with no channels.")
+        return
+    await send_ws_message(ws, "public/subscribe", {"channels": channels})
 
-async def current_instruments(is_authenticated: bool):
-    logger.info(f"Entering current_instruments. is_authenticated: {is_authenticated}")
-    # print(f"DEBUG_PRINT: Entering current_instruments. is_authenticated: {is_authenticated}", file=sys.stderr); sys.stderr.flush()
+async def unsubscribe_channels(ws, channels):
+    if not channels:
+        logger.warning("Unsubscribe called with no channels.")
+        return
+    await send_ws_message(ws, "public/unsubscribe", {"channels": channels})
 
-    instruments_url = f"{settings.deribit_rest}/public/get_instruments"
-    params=dict(currency=settings.currency, kind="option", expired="false")
-    logger.debug(f"Fetching instruments from URL: {instruments_url} with params: {params}")
-    # print(f"DEBUG_PRINT: Fetching instruments from URL: {instruments_url} with params: {params}", file=sys.stderr); sys.stderr.flush()
 
-    api_data_result = [] # Initialize to ensure it's a list
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(instruments_url, params=params, timeout=20) as r:
-                logger.debug(f"get_instruments HTTP status: {r.status}")
-                # print(f"DEBUG_PRINT: get_instruments HTTP status: {r.status}", file=sys.stderr); sys.stderr.flush()
-                response_text_snippet = await r.text()
-                response_text_snippet = response_text_snippet[:500]
+class DeribitCollector:
+    def __init__(self, redis_client):
+        self.redis = redis_client
+        self.ws = None
+        self.token = None
+        self.token_exp = 0
+        self.is_authenticated_session = False
+        
+        self.latest_instrument_summaries = [] # Stores the list of dicts from book_summary
+        self.active_ticker_subscriptions = set() # Stores names like "BTC-26JUL24-80000-C"
+        
+        self._new_summary_event = asyncio.Event()
+        self._shutdown_event = asyncio.Event()
 
-                if r.status != 200:
-                    logger.error(f"HTTP error fetching instruments: {r.status}. Response: {response_text_snippet}")
-                    return [] 
-                try:
-                    json_response = await r.json(content_type=None)
-                    logger.debug(f"get_instruments JSON response (first 200 chars): {str(json_response)[:200]}")
-                    api_data_result = json_response.get("result", []) # Assign to api_data_result
-                    if not isinstance(api_data_result, list):
-                        logger.error(f"API 'result' for get_instruments is not a list. Type: {type(api_data_result)}. Payload: {str(json_response)[:500]}")
-                        api_data_result = []
-                except json.JSONDecodeError as json_err:
-                    logger.error(f"JSON decode error fetching instruments: {json_err}. Response text: {response_text_snippet}", exc_info=True)
-                    return []
-    except Exception as e:
-        logger.error(f"Generic error during instrument fetch API call: {e}", exc_info=True)
-        return []
+    async def _ensure_auth(self):
+        if not self.token or time.time() > self.token_exp:
+            self.token, self.token_exp = await auth_token()
+            self.is_authenticated_session = self.token is not None
+        return self.is_authenticated_session
 
-    logger.info(f"Raw instrument data fetched from API, count: {len(api_data_result)}. First item if any: {str(api_data_result[0])[:200] if api_data_result else 'N/A'}")
-    # print(f"DEBUG_PRINT: Raw data fetched, count: {len(api_data_result)}. First item if any: {str(api_data_result[0])[:200] if api_data_result else 'N/A'}", file=sys.stderr); sys.stderr.flush()
-
-    selected_instrument_names = []
-
-    if not api_data_result: # Check if api_data_result is empty
-        logger.warning("No instrument data received from API's 'result' field or API call failed.")
-        return []
-
-    # Filter for items that are dicts and have 'instrument_name'
-    # The /public/get_instruments endpoint DOES NOT contain 'open_interest'
-    # So we cannot filter or sort by it here.
-    
-    valid_items_with_name = []
-    for idx, d_item in enumerate(api_data_result): # Iterate over api_data_result
-        if not isinstance(d_item, dict):
-            logger.warning(f"Item {idx} in instrument data is not a dict: {str(d_item)[:100]}")
-            continue
-        if "instrument_name" in d_item:
-            valid_items_with_name.append(d_item)
-        else:
-            logger.debug(f"Filtering out instrument because it's missing 'instrument_name': {str(d_item)[:100]}")
-
-    logger.info(f"Found {len(valid_items_with_name)} instruments with an 'instrument_name' field from the API response.")
-    # print(f"DEBUG_PRINT: Found {len(valid_items_with_name)} instruments with an 'instrument_name' field.", file=sys.stderr); sys.stderr.flush()
+    async def _handle_book_summary(self, data):
+        if isinstance(data, list):
+            self.latest_instrument_summaries = data
+            self._new_summary_event.set() # Signal that new summaries are available
+            logger.info(f"Received book_summary with {len(data)} instruments.")
             
-    if not valid_items_with_name:
-        logger.warning("No instruments with 'instrument_name' found after basic validation. Returning empty list.")
-        # print("DEBUG_PRINT: No instruments with 'instrument_name' found. Returning empty list.", file=sys.stderr); sys.stderr.flush()
-        return []
+            # Push to Redis stream for ClickHouse writer
+            payload_to_store = {
+                "ts": time.time(), # Timestamp when collector received it
+                "summary_data": data # Store the whole list as received
+            }
+            await self.redis.xadd(
+                STREAM_KEY_BOOK_SUMMARIES_FEED,
+                {"d": orjson.dumps(payload_to_store)}
+            )
+            logger.debug(f"Pushed book_summary (len {len(data)}) to {STREAM_KEY_BOOK_SUMMARIES_FEED}")
+        else:
+            logger.warning(f"Received book_summary with unexpected data type: {type(data)}")
 
-    if not is_authenticated:
-        logger.info(f"UNAUTH mode: Selecting up to {MAX_UNAUTH_STRIKES} instruments from {len(valid_items_with_name)} valid fetched items (Deribit default sort).")
-        # print(f"DEBUG_PRINT: UNAUTH mode: Selecting up to {MAX_UNAUTH_STRIKES} from {len(valid_items_with_name)}.", file=sys.stderr); sys.stderr.flush()
-        selected_instrument_names = [d["instrument_name"] for d in valid_items_with_name[:MAX_UNAUTH_STRIKES]]
-    else: # Authenticated mode
-        max_instruments_to_subscribe = settings.deribit_max_auth_instruments
-        logger.info(f"AUTH mode: Selecting up to {max_instruments_to_subscribe} instruments from {len(valid_items_with_name)} valid fetched items (Deribit default sort).")
-        # print(f"DEBUG_PRINT: AUTH mode: Selecting up to {max_instruments_to_subscribe} from {len(valid_items_with_name)}.", file=sys.stderr); sys.stderr.flush()
-        selected_instrument_names = [d["instrument_name"] for d in valid_items_with_name[:max_instruments_to_subscribe]]
+    async def _manage_ticker_subscriptions_task(self):
+        logger.info("Dynamic ticker subscription manager task started.")
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._new_summary_event.wait(), timeout=settings.dynamic_subscription_refresh_interval_seconds)
+            except asyncio.TimeoutError:
+                logger.debug("Subscription refresh interval timed out, checking summaries anyway.")
+            
+            self._new_summary_event.clear() # Reset event
+            
+            if not self.is_authenticated_session: # Only manage dynamically if authenticated
+                logger.debug("Not authenticated, skipping dynamic subscription management.")
+                await asyncio.sleep(settings.dynamic_subscription_refresh_interval_seconds) # Check again later
+                continue
 
-    logger.info(f"Exiting current_instruments, selected {len(selected_instrument_names)} instruments for subscription.")
-    # print(f"DEBUG_PRINT: Exiting current_instruments, returning {len(selected_instrument_names)} instruments.", file=sys.stderr); sys.stderr.flush()
-    return selected_instrument_names
+            if not self.latest_instrument_summaries:
+                logger.warning("No instrument summaries available to manage ticker subscriptions.")
+                await asyncio.sleep(10) # Wait a bit before retrying
+                continue
 
-# ... (rest of deribit_ws.py, including the run function, remains the same as the previous good version) ...
-# Make sure the logger setup at the top of the file is also present.
+            if not self.ws or self.ws.closed:
+                logger.warning("WebSocket not connected, cannot manage subscriptions.")
+                await asyncio.sleep(10)
+                continue
+
+            logger.debug(f"Managing ticker subscriptions. Found {len(self.latest_instrument_summaries)} total summaries.")
+            
+            # Filter for valid summaries and sort by Open Interest
+            valid_summaries = [
+                s for s in self.latest_instrument_summaries 
+                if isinstance(s, dict) and "instrument_name" in s and isinstance(s.get("open_interest"), (int, float))
+            ]
+            
+            sorted_by_oi = sorted(valid_summaries, key=lambda x: x.get("open_interest", 0.0), reverse=True)
+            
+            top_n_instruments = {
+                s["instrument_name"] for s in sorted_by_oi[:settings.deribit_max_auth_instruments]
+            }
+
+            logger.info(f"Targeting top {len(top_n_instruments)} instruments by OI (max_config: {settings.deribit_max_auth_instruments}).")
+
+            to_subscribe = list(top_n_instruments - self.active_ticker_subscriptions)
+            to_unsubscribe = list(self.active_ticker_subscriptions - top_n_instruments)
+
+            if to_unsubscribe:
+                logger.info(f"Unsubscribing from {len(to_unsubscribe)} tickers: {to_unsubscribe[:5]}...") # Log first 5
+                await unsubscribe_channels(self.ws, [f"ticker.{inst}.100ms" for inst in to_unsubscribe])
+                self.active_ticker_subscriptions.difference_update(to_unsubscribe)
+            
+            if to_subscribe:
+                logger.info(f"Subscribing to {len(to_subscribe)} new tickers: {to_subscribe[:5]}...") # Log first 5
+                await subscribe_channels(self.ws, [f"ticker.{inst}.100ms" for inst in to_subscribe])
+                self.active_ticker_subscriptions.update(to_subscribe)
+            
+            if not to_subscribe and not to_unsubscribe:
+                logger.debug("Ticker subscriptions are already up-to-date with top N by OI.")
+
+            logger.info(f"Currently subscribed to {len(self.active_ticker_subscriptions)} tickers.")
+
+        logger.info("Dynamic ticker subscription manager task stopped.")
+
+    async def _message_handler_loop(self):
+        logger.info("Message handler loop started.")
+        initial_subscriptions_done = False
+        while not self._shutdown_event.is_set() and self.ws and not self.ws.closed:
+            if not initial_subscriptions_done:
+                # Base subscriptions
+                base_channels = [
+                    f"deribit_price_index.{settings.currency.lower()}_usd",
+                    f"book_summary.option.{settings.currency.lower()}.all"
+                ]
+                logger.info(f"Sending initial base subscriptions: {base_channels}")
+                await subscribe_channels(self.ws, base_channels)
+                initial_subscriptions_done = True # Set after sending
+
+            try:
+                msg_raw = await asyncio.wait_for(self.ws.recv(), timeout=5.0)
+                msg_json = orjson.loads(msg_raw)
+                logger.debug(f"< WS RECV: {str(msg_raw)[:250]}") # Log raw for debug
+
+                method = msg_json.get("method")
+                params = msg_json.get("params")
+
+                if method == "subscription":
+                    channel = params.get("channel")
+                    data = params.get("data")
+                    
+                    if channel.startswith("book_summary.option."):
+                        await self._handle_book_summary(data)
+                    elif channel.startswith("deribit_price_index.") or channel.startswith("ticker."):
+                        # Push all ticker and index data to dealer_raw for processor
+                        await self.redis.xadd(STREAM_KEY_RAW, {"d": msg_raw}) # Store raw original message
+                    # else: # Other subscriptions we might add in future
+                        # logger.debug(f"Data on unhandled channel: {channel}")
+                elif "id" in msg_json and "result" in msg_json:
+                    logger.debug(f"Received result for request ID {msg_json['id']}: {str(msg_json['result'])[:100]}")
+                elif "error" in msg_json:
+                    logger.error(f"Received error from Deribit: {msg_json['error']}")
+                # Handle heartbeat/test requests if Deribit sends them via JSON-RPC
+                elif msg_json.get("method") == "public/test":
+                    await send_ws_message(self.ws, "public/test")
 
 
-async def run():
-    # ... (ensure redis connection and wait_for_redis as before)
-    redis = await get_redis() # Simplified for example
-    # await wait_for_redis(redis) # Assume this is handled if needed by processor's pattern
-
-    logger.info("Collector process starting run loop.") # Changed from "COLLECTOR: launching …"
-    print("DEBUG_PRINT: Collector process starting run loop.", file=sys.stderr)
-    sys.stderr.flush()
-
-
-    while True:
-        token, token_exp = await auth_token()
-        is_authenticated_session = token is not None
-        logger.debug(f"Run loop: Auth status: {is_authenticated_session}, Token: {'SET' if token else 'NOT_SET'}")
-        print(f"DEBUG_PRINT: Run loop: Auth status: {is_authenticated_session}, Token: {'SET' if token else 'NOT_SET'}", file=sys.stderr)
-        sys.stderr.flush()
-
-
-        instruments_to_watch = [] # Ensure it's defined
-        try:
-            instruments_to_watch = await current_instruments(is_authenticated_session)
-        except Exception as e:
-            logger.error(f"Critical unhandled error calling current_instruments: {e}", exc_info=True)
-            print(f"DEBUG_PRINT: Critical unhandled error calling current_instruments: {e}", file=sys.stderr)
-            sys.stderr.flush()
-            instruments_to_watch = [] # Ensure it's an empty list on such failure
-            await asyncio.sleep(15) # Wait before retrying loop
-            continue
+            except asyncio.TimeoutError:
+                # No message received, good time to send a keepalive if needed or check connection
+                if self.ws and not self.ws.closed:
+                    try:
+                        logger.debug("Sending heartbeat (public/test) due to recv timeout.")
+                        await send_ws_message(self.ws, "public/test")
+                    except Exception as e:
+                        logger.error(f"Failed to send heartbeat: {e}")
+                        # This might indicate connection is truly dead, loop will break on next ws.recv()
+                continue # Continue to next iteration of recv
+            except websockets.exceptions.ConnectionClosed:
+                logger.warning("WebSocket connection closed during recv.")
+                break # Exit message handler loop
+            except Exception as e:
+                logger.error(f"Error in message handler loop: {e}", exc_info=True)
+                # Potentially break or sleep depending on error severity
+                await asyncio.sleep(1) # Brief pause after an error
         
-        logger.info(f"current_instruments returned {len(instruments_to_watch)} instruments.")
-        print(f"DEBUG_PRINT: current_instruments returned {len(instruments_to_watch)} instruments.", file=sys.stderr)
-        sys.stderr.flush()
+        logger.info("Message handler loop stopped.")
 
-        if not instruments_to_watch:
-            logger.warning("No instruments selected to watch by current_instruments. Retrying instrument fetch in 30s.")
-            print("DEBUG_PRINT: No instruments selected to watch by current_instruments. Retrying instrument fetch in 30s.", file=sys.stderr)
-            sys.stderr.flush()
-            await asyncio.sleep(30)
-            continue # Go to next iteration of while True to re-fetch instruments
 
-        # ... (rest of your subscription and streaming logic)
-        spot_ch = f"deribit_price_index.{settings.currency.lower()}_usd"
-        subs = [spot_ch]
-        subs.extend([f"ticker.{i}.100ms" for i in instruments_to_watch])
+    async def run_forever(self):
+        logger.info("Collector run_forever starting.")
+        subscription_manager_task = None
         
-        mode = "auth" if is_authenticated_session else "unauth"
-        logger.info(f"Connecting ({mode}), {len(subs)} channels (spot + {len(instruments_to_watch)} option tickers)...")
-        print(f"DEBUG_PRINT: Connecting ({mode}), {len(subs)} channels (spot + {len(instruments_to_watch)} option tickers)...", file=sys.stderr)
-        sys.stderr.flush()
+        while not self._shutdown_event.is_set():
+            await self._ensure_auth() # Ensure we have a token if possible
+            
+            connect_headers = {}
+            if self.token and self.is_authenticated_session:
+                connect_headers["Authorization"] = f"Bearer {self.token}"
+            
+            mode_log = "auth" if self.is_authenticated_session else "unauth"
+            logger.info(f"Attempting WebSocket connection ({mode_log} mode)...")
 
+            try:
+                async with websockets.connect(
+                    settings.deribit_ws,
+                    extra_headers=connect_headers,
+                    ping_interval=20, # websockets library handles pings
+                    ping_timeout=20
+                ) as ws_connection:
+                    self.ws = ws_connection
+                    logger.info(f"WebSocket connected successfully ({mode_log} mode).")
 
-        try:
-            async with websockets.connect(
-                settings.deribit_ws, extra_headers=({"Authorization": f"Bearer {token}"} if token else {}), ping_interval=20
-            ) as ws:
-                # ... subscribe logic ...
-                req = {
-                    "jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": "public/subscribe",
-                    "params": {"channels": subs},
-                }
-                await ws.send(orjson.dumps(req).decode())
-                logger.info("Subscribed to channels, streaming data...")
-                print("DEBUG_PRINT: Subscribed to channels, streaming data...", file=sys.stderr)
-                sys.stderr.flush()
-                
-                cnt = 0
-                async for msg in ws:
-                    await redis.xadd(STREAM_KEY_RAW, {"d": msg.encode()}) # Ensure redis is defined and connected
-                    cnt += 1
-                    if cnt % 500 == 0: # Adjust threshold as needed
-                        logger.info(f"Pushed {cnt} msgs to Redis stream '{STREAM_KEY_RAW}'.")
-                        print(f"DEBUG_PRINT: Pushed {cnt} msgs to Redis stream '{STREAM_KEY_RAW}'.", file=sys.stderr)
-                        sys.stderr.flush()
+                    if self.is_authenticated_session and subscription_manager_task is None:
+                         # Start manager task only if authenticated and not already running
+                        subscription_manager_task = asyncio.create_task(self._manage_ticker_subscriptions_task())
+                    
+                    # Run message handler
+                    await self._message_handler_loop()
 
-        except websockets.exceptions.ConnectionClosedError as cce:
-            logger.error(f"WebSocket ConnectionClosedError: {cce} – reconnect in 5s", exc_info=True)
-        except Exception as e: # Catch other websocket errors
-            logger.error(f"WebSocket error: {e} – reconnect in 5s", exc_info=True)
+            except websockets.exceptions.InvalidStatusCode as e:
+                logger.error(f"WebSocket connection failed with status: {e.status_code} {e.headers}. Retrying in 10s.")
+            except websockets.exceptions.ConnectionClosedError as e:
+                logger.warning(f"WebSocket connection closed: {e}. Retrying in 5s.")
+            except ConnectionRefusedError:
+                logger.error("WebSocket connection refused. Retrying in 10s.")
+            except Exception as e:
+                logger.error(f"Unhandled WebSocket connection error: {e}", exc_info=True)
+            finally:
+                self.ws = None # Clear ws on disconnect
+                if subscription_manager_task and not self.is_authenticated_session:
+                    # If we lost auth and task was running, it should stop or be cancelled
+                    logger.info("Lost authentication, ensuring subscription manager stops if running.")
+                    # The task itself checks self.is_authenticated_session, so it should pause.
+                    # For a hard stop, you might need cancellation logic.
+
+            if self._shutdown_event.is_set(): break
+            logger.info("Sleeping for 5 seconds before attempting reconnect.")
+            await asyncio.sleep(5)
         
-        print("DEBUG_PRINT: Websocket connection lost or error, sleeping before reconnect.", file=sys.stderr)
-        sys.stderr.flush()
-        await asyncio.sleep(5)
+        logger.info("Collector run_forever loop ended.")
+        if subscription_manager_task:
+            logger.info("Waiting for subscription manager task to finish...")
+            await subscription_manager_task # Allow it to finish gracefully
 
+    def stop(self):
+        logger.info("Collector stop requested.")
+        self._shutdown_event.set()
+        if self.ws: # Attempt graceful close if connected
+            asyncio.create_task(self.ws.close(code=1000, reason="Collector shutdown"))
+
+
+async def main_run(): # Renamed from 'run' to avoid conflict if this file is imported
+    redis_client = await get_redis()
+    # TODO: Add wait_for_redis(redis_client) here if needed, like in processor
+    
+    collector = DeribitCollector(redis_client)
+    try:
+        await collector.run_forever()
+    except KeyboardInterrupt:
+        logger.info("Collector main_run received KeyboardInterrupt.")
+    finally:
+        logger.info("Collector main_run stopping.")
+        collector.stop()
+        # Potentially wait for tasks to fully complete if needed
+        # await asyncio.sleep(1) # Short delay for cleanup
 
 if __name__ == "__main__":
-    # Initial log to confirm entry
-    print("DEBUG_PRINT: deribit_ws.py __main__ starting.", file=sys.stderr)
-    sys.stderr.flush()
-    
-    # Ensure redis client is initialized for the main run, if run standalone for testing.
-    # loop = asyncio.get_event_loop()
-    # redis_client_main = loop.run_until_complete(get_redis()) # Example, adapt if needed
-    # if not loop.run_until_complete(wait_for_redis(redis_client_main)):
-    #     print("CRITICAL: Redis not available for standalone deribit_ws.py. Exiting.", file=sys.stderr)
-    #     sys.exit(1)
-
+    logger.info("Deribit WS Collector starting as main process...")
     try:
-        asyncio.run(run())
+        asyncio.run(main_run())
     except KeyboardInterrupt:
-        logger.info("Collector interrupted by user, exiting.")
-        print("DEBUG_PRINT: Collector interrupted by user, exiting.", file=sys.stderr)
-        sys.stderr.flush()
+        logger.info("Collector stopped by KeyboardInterrupt (asyncio.run).")
     except Exception as e:
-        logger.critical(f"Collector asyncio.run() CRASHED: {e}", exc_info=True)
-        print(f"DEBUG_PRINT: Collector asyncio.run() CRASHED: {e}", file=sys.stderr)
-        sys.stderr.flush()
+        logger.critical(f"Collector CRASHED at asyncio.run level: {e}", exc_info=True)
+    finally:
+        logger.info("Collector process finished.")
 

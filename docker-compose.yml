@@ -23,9 +23,56 @@ services:
     # volumes:
     #   - redis_data:/data
 
+    # New ClickHouse service
+  clickhouse_server:
+    image: clickhouse/clickhouse-server:latest # Or specific version
+    container_name: dealer_flow_clickhouse_c
+    hostname: clickhouse_server
+    env_file:
+      - .env # For CLICKHOUSE_USER, CLICKHOUSE_PASSWORD, CLICKHOUSE_DB_NAME
+    ports:
+      - "8123:8123" # HTTP interface
+      - "9000:9000" # Native client interface
+    networks:
+      - dealer_net
+    ulimits: # Recommended by ClickHouse docs
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse_schema.sql:/docker-entrypoint-initdb.d/init_schema.sql:ro # Mount DDL
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # New ClickHouse Writer service
+  clickhouse_writer:
+    build: . # Uses the same Dockerfile as the main app
+    image: dealer-flow-stack-img # Uses the same image
+    container_name: dealer_flow_ch_writer_c
+    command: python -m dealer_flow.clickhouse_writer # Command to run this specific service
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      clickhouse_server:
+        condition: service_healthy
+    networks:
+      - dealer_net
+    # restart: unless-stopped
+
 networks:
   dealer_net:
     driver: bridge
+
+# Top-level named volume declarations
+volumes:
+  # redis_data: # Uncomment if you want a named volume for Redis persistence
+  clickhouse_data: # Named volume for ClickHouse data persistence
 
 # Optional: Define named volume for persistence
 # volumes:
