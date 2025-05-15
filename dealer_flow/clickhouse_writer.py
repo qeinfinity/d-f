@@ -11,6 +11,7 @@ from clickhouse_driver.errors import ServerException as ClickHouseServerExceptio
 
 from dealer_flow.config import settings
 from dealer_flow.redis_stream import get_redis, STREAM_KEY_METRICS # Existing metrics stream
+from dealer_flow.processor import wait_for_redis
 # New stream key from collector
 STREAM_KEY_BOOK_SUMMARIES_FEED = "deribit_book_summaries_feed" # Must match collector
 
