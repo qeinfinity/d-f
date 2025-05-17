@@ -724,11 +724,7 @@ After resolving container startup issues, the collector faced communication prob
 Further investigation would be needed to pinpoint the exact cause of the `11050 bad_request` on the initial Deribit subscriptions.
 
 
-
-
-
-
-### Keep checking if this list is satsfied
+### Keep checking if this list is satsfied. (parts may or may not be satisfied currently )
 {
 * dealer_net.py placeholdeDealer Netting Simplification: dealer_net.py uses a placeholder logic. Accurately determining the net dealer position (customer shorts vs. customer longs) is complex and crucial for correct metric interpretation. The current assumption of dealer_side_mult = 1 means all OI is treated as if dealers need to hedge it by taking the opposite side of a customer's vanilla position. need something more sophisticated
 
